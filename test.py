@@ -1,5 +1,11 @@
+import asyncio
 from urllib.parse import urlparse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
+
+app = FastAPI(title="Stream Extractor Web App")
 
 AD_KEYWORDS = (
     "doubleclick", "googlesyndication", "popads", "propeller",
@@ -9,13 +15,16 @@ AD_KEYWORDS = (
 SKIP_WORDS = ("sample", "trailer", "promo", "preview", "teaser")
 
 
+class ExtractRequest(BaseModel):
+    url: str
+
+
 def is_valid_url(url: str) -> bool:
     parsed = urlparse(url.strip())
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 def is_sample_link(locator) -> bool:
-    """Link text or href-la 'sample' / promo words irundha True nu sollum."""
     try:
         text = (locator.inner_text(timeout=1000) or "").strip().lower()
         href = (locator.get_attribute("href", timeout=1000) or "").strip().lower()
@@ -26,7 +35,6 @@ def is_sample_link(locator) -> bool:
 
 
 def click_non_sample_match(active_page, selector: str) -> bool:
-    """Selector-kku match aagura links-la sample illadha first visible link-a click pannum."""
     matches = active_page.locator(selector)
     count = matches.count()
 
@@ -36,11 +44,7 @@ def click_non_sample_match(active_page, selector: str) -> bool:
             if not item.is_visible():
                 continue
             if is_sample_link(item):
-                print(f"   ⏭️ Skipping sample/promo link ({selector} [{i}])")
                 continue
-
-            label = (item.inner_text(timeout=1000) or "").strip()
-            print(f"   -> Clicking non-sample link: '{label or selector}'")
             item.click(timeout=3000)
             return True
         except Exception:
@@ -49,12 +53,14 @@ def click_non_sample_match(active_page, selector: str) -> bool:
     return False
 
 
-def get_stream_from_movie_url(movie_url: str, headless: bool = False) -> str | None:
-    """Sample-a skip panni original / main stream URL edukkum."""
+def get_stream_from_movie_url(movie_url: str) -> str | None:
     found_stream_url = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -83,7 +89,6 @@ def get_stream_from_movie_url(movie_url: str, headless: bool = False) -> str | N
             ctype = headers.get("content-type", "")
             cdisp = headers.get("content-disposition", "")
 
-            # Sample stream URL-a avoid panna try panrom
             if "sample" in res_lower or "sample" in cdisp:
                 return
 
@@ -101,16 +106,14 @@ def get_stream_from_movie_url(movie_url: str, headless: bool = False) -> str | N
         page = context.new_page()
 
         try:
-            print(f"⏳ Loading URL: {movie_url}")
             page.goto(movie_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2500)
 
-            for step in range(6):
+            for _ in range(6):
                 if found_stream_url:
                     break
 
                 active_page = context.pages[-1]
-                print(f"   Step {step + 1}: {active_page.url}")
 
                 if active_page.locator("video").count() > 0:
                     try:
@@ -121,7 +124,6 @@ def get_stream_from_movie_url(movie_url: str, headless: bool = False) -> str | N
                     except Exception:
                         pass
 
-                # 'Original' / 'Full' links-a first priority-la vekkurom
                 selectors = [
                     "a:has-text('Original')",
                     "a:has-text('Full')",
@@ -149,35 +151,171 @@ def get_stream_from_movie_url(movie_url: str, headless: bool = False) -> str | N
                 if not clicked:
                     active_page.wait_for_timeout(2000)
 
-        except Exception as e:
-            print(f"⚠️ Error: {e}")
         finally:
             browser.close()
 
     return found_stream_url
 
 
-def main():
-    while True:
-        user_url = input("\nMovie / Video Page URL enter pannunga (exit nu type panna veliya varalaam): ").strip()
-        if not user_url:
-            continue
-        if user_url.lower() == "exit":
-            print("Bye! App project-kku best of luck.")
-            break
+HTML_UI = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stream Extractor</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      display: flex;
+      justify-content: center;
+      padding: 40px 16px;
+      margin: 0;
+    }
+    .card {
+      background: #1e293b;
+      padding: 24px;
+      border-radius: 12px;
+      width: 100%;
+      max-width: 680px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+    }
+    h2 { margin-top: 0; }
+    .row { display: flex; gap: 10px; margin-bottom: 16px; }
+    input {
+      flex: 1;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: #0f172a;
+      color: #fff;
+      font-size: 15px;
+    }
+    button {
+      padding: 12px 18px;
+      border: none;
+      border-radius: 8px;
+      background: #3b82f6;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .result {
+      display: none;
+      background: #0f172a;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      margin-top: 16px;
+    }
+    .link-box {
+      word-break: break-all;
+      color: #38bdf8;
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .copy-btn { background: #10b981; }
+    .open-btn { background: #6366f1; text-decoration: none; color: white; padding: 12px 18px; border-radius: 8px; font-weight: 600; font-size: 14px; }
+    video { width: 100%; margin-top: 16px; border-radius: 8px; background: #000; display: none; }
+    .status { color: #94a3b8; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🎬 Stream URL Extractor</h2>
+    <div class="row">
+      <input id="urlInput" type="url" placeholder="Paste movie or video page URL (https://...)" />
+      <button id="extractBtn" onclick="extractStream()">Extract</button>
+    </div>
+    <div id="status" class="status"></div>
 
-        if not is_valid_url(user_url):
-            print("❌ Sariyaana URL kudunga (https://...)")
-            continue
+    <div id="resultBox" class="result">
+      <div id="streamLink" class="link-box"></div>
+      <div class="actions">
+        <button class="copy-btn" onclick="copyLink()">Copy Link</button>
+        <a id="openTab" class="open-btn" target="_blank" rel="noopener">Open in New Tab</a>
+        <button onclick="playHere()">Play Here</button>
+      </div>
+    </div>
 
-        stream_url = get_stream_from_movie_url(user_url, headless=True)
+    <video id="player" controls playsinline></video>
+  </div>
 
-        if stream_url:
-            print("\n🎉 Original Stream URL:")
-            print(stream_url)
-        else:
-            print("\n⚠️ Original Stream URL kidaikkala.")
+  <script>
+    let currentStream = "";
+
+    async function extractStream() {
+      const url = document.getElementById("urlInput").value.trim();
+      const btn = document.getElementById("extractBtn");
+      const status = document.getElementById("status");
+      const resultBox = document.getElementById("resultBox");
+      const player = document.getElementById("player");
+
+      if (!url) return;
+
+      btn.disabled = true;
+      resultBox.style.display = "none";
+      player.style.display = "none";
+      player.pause();
+      status.textContent = "⏳ Extracting stream URL... (10-20 seconds aagalaam)";
+
+      try {
+        const res = await fetch("/extract", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          status.textContent = "❌ " + (data.detail || "Extraction failed");
+        } else {
+          currentStream = data.stream_url;
+          document.getElementById("streamLink").textContent = currentStream;
+          document.getElementById("openTab").href = currentStream;
+          resultBox.style.display = "block";
+          status.textContent = "✅ Stream URL kidaichiduchu!";
+        }
+      } catch (err) {
+        status.textContent = "⚠️ Network error: " + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function copyLink() {
+      navigator.clipboard.writeText(currentStream);
+      document.getElementById("status").textContent = "📋 Link copied! Browser tab or VLC-la paste pannunga.";
+    }
+
+    function playHere() {
+      const player = document.getElementById("player");
+      player.src = currentStream;
+      player.style.display = "block";
+      player.play();
+    }
+  </script>
+</body>
+</html>
+"""
 
 
-if __name__ == "__main__":
-    main()
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML_UI
+
+
+@app.post("/extract")
+async def extract_endpoint(payload: ExtractRequest):
+    if not is_valid_url(payload.url):
+        raise HTTPException(status_code=400, detail="Sariyaana URL kudunga (https://...)")
+
+    stream_url = await asyncio.to_thread(get_stream_from_movie_url, payload.url)
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="Original Stream URL kidaikkala.")
+
+    return {"stream_url": stream_url}
